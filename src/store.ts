@@ -1,11 +1,41 @@
 import { redraw } from 'mithril';
-import type { ProofCheck, ProofDocument, ProofStep, ProofVersion } from './types';
+import { RuleLibrary, type ImportResult } from './rulepacks';
+import {
+  conflictMessage,
+  confirmBinding,
+  createBinding,
+  exportBlockers,
+  isPremiseAxiom,
+  reconcileDocument,
+  requiredSlotsComplete,
+  resolveLegacyBinding,
+  usedPackIds,
+  validateBinding,
+} from './rulebindings';
+import type { ProofCheck, ProofDocument, ProofStep, ProofVersion, RuleBinding } from './types';
 
 const STORAGE_KEY = 'sologsb-1014-proof-workspace-v1';
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 const clone = <T>(value: T): T => structuredClone(value);
 
-export const RULES = ['前提', '定义展开', '代入', '等式变形', '分配律', '同类项合并', '数学归纳', '反证法', '构造法', '结论'];
+/** 旧版本固定规则下拉项；新数据通过规则包引用规则。 */
+export const RULES = ['前提', '定义展开', '代入', '等式变形', '分配律', '同类项合并', '交换律', '数学归纳', '反证法', '构造法', '结论'];
+
+export const ruleLibrary = new RuleLibrary();
+
+/** 前提槽绑定变化时，同步维护步骤间引用关系（删除步骤等旧逻辑仍读取 references）。 */
+function syncReferences(step: ProofStep): void {
+  const rule = step.binding?.snapshot?.rule;
+  if (!rule) return;
+  const ids: string[] = [];
+  rule.slots.forEach((slot) => {
+    if (slot.kind === 'premise') {
+      const value = step.binding?.slots[slot.id];
+      if (value && value !== step.id && !ids.includes(value)) ids.push(value);
+    }
+  });
+  step.references = ids;
+}
 
 function sampleSteps(): ProofStep[] {
   return [
@@ -26,9 +56,19 @@ function issueSteps(): ProofStep[] {
   ];
 }
 
+/** 旧证明缺绑定时按规则名称生成待确认映射；匹配唯一则固定来源并预填槽位。 */
+function migrateLegacyBindings(documents: ProofDocument[]): void {
+  documents.forEach((document) => {
+    document.steps.forEach((step) => {
+      if (step.binding || !step.rule) return;
+      step.binding = resolveLegacyBinding(ruleLibrary, step, step.rule);
+    });
+  });
+}
+
 function initialDocuments(): ProofDocument[] {
   const now = new Date().toISOString();
-  return [
+  const docs: ProofDocument[] = [
     {
       id: 'doc-algebra',
       title: '完全平方公式证明',
@@ -50,6 +90,8 @@ function initialDocuments(): ProofDocument[] {
       updatedAt: now,
     },
   ];
+  migrateLegacyBindings(docs);
+  return docs;
 }
 
 function loadDocuments(): ProofDocument[] {
@@ -57,7 +99,15 @@ function loadDocuments(): ProofDocument[] {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return initialDocuments();
     const parsed = JSON.parse(raw) as ProofDocument[];
-    return Array.isArray(parsed) && parsed.length ? parsed : initialDocuments();
+    if (!Array.isArray(parsed) || !parsed.length) return initialDocuments();
+    const before = JSON.stringify(parsed);
+    migrateLegacyBindings(parsed);
+    parsed.forEach((document) => reconcileDocument(ruleLibrary, document));
+    // 迁移生成的待确认映射与来源必须在重开后保留：内容变化时立即落盘。
+    if (JSON.stringify(parsed) !== before) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+    }
+    return parsed;
   } catch {
     return initialDocuments();
   }
@@ -65,6 +115,7 @@ function loadDocuments(): ProofDocument[] {
 
 export class ProofStore {
   documents = loadDocuments();
+  library = ruleLibrary;
   activeId = this.documents[0]?.id ?? '';
   selectedStepId = this.documents[0]?.steps[0]?.id ?? '';
   compareVersionId = '';
@@ -83,8 +134,16 @@ export class ProofStore {
   }
 
   get checks(): ProofCheck[] {
-    if (!this.current) return [];
-    return validate(this.current);
+    return validate(this.current, this.library);
+  }
+
+  /** 存在未确认绑定或槽位问题时禁止导出。 */
+  get exportBlocked(): ProofStep[] {
+    const blockers = exportBlockers(this.current);
+    return blockers.filter((step) => {
+      if (step.binding?.status === 'confirmed') return validateBinding(step.binding, step, this.current).length > 0;
+      return true;
+    });
   }
 
   save(): void {
@@ -143,14 +202,14 @@ export class ProofStore {
       author: '本地用户',
       goal: '$A=B$',
       symbols: { A: '待定义对象', B: '待定义对象' },
-      steps: [{ id: uid('step'), type: 'premise', statement: '在这里输入前提', rule: '前提', references: [], note: '', counterexample: '', alternative: '' }],
+      steps: [],
       versions: [],
       updatedAt: new Date().toISOString(),
     };
     this.undoStack.push(clone(this.documents));
     this.documents.unshift(document);
     this.activeId = id;
-    this.selectedStepId = document.steps[0].id;
+    this.addStep('premise');
     this.save();
   }
 
@@ -165,20 +224,43 @@ export class ProofStore {
     this.save();
   }
 
+  /** 新步骤立即引用规则包中的规则（待确认），不再只存规则名称。 */
+  private bindingFor(type: ProofStep['type']): RuleBinding | undefined {
+    const ruleName = type === 'goal' ? '结论' : type === 'premise' ? '前提' : '等式变形';
+    const match = this.library.findRuleByName(ruleName).find((item) => item.pack.id === 'pack-elementary-algebra')
+      ?? this.library.findRuleByName(ruleName)[0];
+    if (!match) return undefined;
+    const placeholder: ProofStep = { id: '', type, statement: '', rule: ruleName, references: [], note: '', counterexample: '', alternative: '' };
+    return createBinding(this.library, match.pack.id, match.rule.id, placeholder) ?? undefined;
+  }
+
   addStep(type: ProofStep['type'] = 'derivation'): void {
     const step: ProofStep = {
       id: uid('step'),
       type,
-      statement: type === 'goal' ? '$A=B$' : '输入新的推导式',
-      rule: type === 'goal' ? '结论' : '等式变形',
+      statement: type === 'goal' ? '$A=B$' : type === 'premise' ? '输入前提条件' : '输入新的推导式',
+      rule: type === 'goal' ? '结论' : type === 'premise' ? '前提' : '等式变形',
       references: this.selectedStepId ? [this.selectedStepId] : [],
       note: '',
       counterexample: '',
       alternative: '',
+      binding: this.bindingFor(type),
     };
+    if (step.binding) {
+      // 把预填的相对引用落到真实的当前选中步骤。
+      const rule = step.binding.snapshot?.rule;
+      rule?.slots.forEach((slot) => {
+        if (slot.kind === 'premise' && this.selectedStepId) step.binding!.slots[slot.id] = this.selectedStepId;
+      });
+      syncReferences(step);
+    }
     this.update((document) => {
+      if (type === 'goal' || document.steps.length === 0) {
+        document.steps.push(step);
+        return;
+      }
       const selectedIndex = document.steps.findIndex((item) => item.id === this.selectedStepId);
-      document.steps.splice(type === 'goal' ? document.steps.length : selectedIndex + 1, 0, step);
+      document.steps.splice(selectedIndex < 0 ? document.steps.length : selectedIndex + 1, 0, step);
     });
     this.selectedStepId = step.id;
   }
@@ -188,6 +270,17 @@ export class ProofStore {
       document.steps = document.steps.filter((step) => step.id !== id);
       document.steps.forEach((step) => {
         step.references = step.references.filter((reference) => reference !== id);
+        // 槽位绑定的依据被删除：清空绑定并退回待确认。
+        if (step.binding) {
+          let touched = false;
+          Object.entries(step.binding.slots).forEach(([slotId, value]) => {
+            if (value === id) {
+              delete step.binding!.slots[slotId];
+              touched = true;
+            }
+          });
+          if (touched && step.binding.status === 'confirmed') step.binding.status = 'pending';
+        }
       });
     });
     this.ensureSelection();
@@ -212,6 +305,95 @@ export class ProofStore {
     });
   }
 
+  /** 为步骤选择规则包中的具体规则；冲突包不能混用。 */
+  bindStep(stepId: string, packId: string, ruleId: string): void {
+    const conflict = conflictMessage(this.library, packId, this.current);
+    if (conflict) {
+      this.notify(conflict);
+      return;
+    }
+    this.update((document) => {
+      const step = document.steps.find((item) => item.id === stepId);
+      if (!step) return;
+      const binding = createBinding(this.library, packId, ruleId, step);
+      if (!binding) return;
+      step.binding = binding;
+      step.rule = binding.snapshot?.ruleName ?? step.rule;
+      syncReferences(step);
+    });
+  }
+
+  /** 旧证明的待确认映射：按用户选择的来源规则固定快照。 */
+  resolveLegacy(stepId: string, packId: string, ruleId: string): void {
+    this.bindStep(stepId, packId, ruleId);
+  }
+
+  updateSlot(stepId: string, slotId: string, value: string): void {
+    this.update((document) => {
+      const step = document.steps.find((item) => item.id === stepId);
+      const binding = step?.binding;
+      if (!step || !binding) return;
+      if (value) binding.slots[slotId] = value;
+      else delete binding.slots[slotId];
+      if (binding.status === 'confirmed') binding.status = 'pending';
+      syncReferences(step);
+    });
+  }
+
+  /** 逐条确认引用：固定当前规则内容，槽位齐备才可标记已确认。 */
+  confirmStep(stepId: string): void {
+    let message = '';
+    this.update((document) => {
+      const step = document.steps.find((item) => item.id === stepId);
+      if (!step?.binding?.snapshot) return;
+      const updated = confirmBinding(this.library, step);
+      if (!updated?.snapshot) {
+        message = '规则来源已不在库中，无法确认';
+        return;
+      }
+      const rule = updated.snapshot.rule;
+      if (!requiredSlotsComplete(rule, updated)) message = '仍有必填槽位未绑定';
+      syncReferences(step);
+    });
+    if (message) this.notify(message);
+  }
+
+  unbindStep(stepId: string): void {
+    this.update((document) => {
+      const step = document.steps.find((item) => item.id === stepId);
+      if (!step) return;
+      step.binding = undefined;
+      step.references = [];
+    });
+  }
+
+  /** 导入规则包：同 id 覆盖更新，引用旧内容的步骤立即失效、标记待复核。 */
+  importRulePack(text: string): ImportResult {
+    const result = this.library.importPack(text);
+    if (result.ok) {
+      let affected = 0;
+      this.documents.forEach((document) => {
+        affected += reconcileDocument(this.library, document);
+      });
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.documents));
+      if (affected) this.notify(`规则包已更新，${affected} 个步骤标记为待复核`);
+      redraw();
+    }
+    return result;
+  }
+
+  /** 演示规则包发布修订：受影响步骤立即失效，原绑定保留。 */
+  bumpRulePack(packId: string): void {
+    const pack = this.library.bumpPack(packId, '规则包发布修订');
+    if (!pack) return;
+    let affected = 0;
+    this.documents.forEach((document) => {
+      affected += reconcileDocument(this.library, document);
+    });
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(this.documents));
+    this.notify(affected ? `「${pack.name}」已修订，${affected} 个步骤待复核` : `「${pack.name}」已修订，当前文档暂无引用步骤`);
+  }
+
   createVersion(): void {
     this.update((document) => {
       const version: ProofVersion = {
@@ -234,7 +416,7 @@ export class ProofStore {
         this.toast = '';
         redraw();
       }
-    }, 2200);
+    }, 2600);
   }
 }
 
@@ -242,11 +424,30 @@ function stripLatexCommands(text: string): string {
   return text.replace(/\\[A-Za-z]+/g, ' ').replace(/[{}_^]/g, ' ');
 }
 
-export function validate(document: ProofDocument): ProofCheck[] {
+export function validate(document: ProofDocument, library: RuleLibrary): ProofCheck[] {
   const checks: ProofCheck[] = [];
   const ids = new Set(document.steps.map((step) => step.id));
   const symbolKeys = new Set(Object.keys(document.symbols));
-  const ignored = new Set(['a', 'A', 'b', 'B', 'n', 'k', 'P', 'Q', 'R', 'x', 'y', 'to', 'text', 'frac', 'sqrt']);
+  const ignored = new Set(['a', 'A', 'b', 'B', 'n', 'k', 'P', 'Q', 'R', 'x', 'y', 'z', 'l', 'to', 'text', 'frac', 'sqrt']);
+
+  // 冲突包不能混用：同一证明内出现互斥规则包即报错。
+  const activePackIds = usedPackIds(document);
+  activePackIds.forEach((packId) => {
+    const pack = library.get(packId);
+    pack?.conflictsWith.forEach((otherId) => {
+      const other = library.get(otherId);
+      if (other && activePackIds.includes(otherId)) {
+        const owner = document.steps.find((step) => step.binding?.snapshot?.packId === packId);
+        checks.push({
+          id: `conflict-${packId}-${otherId}`,
+          severity: 'error',
+          title: '混用了冲突规则包',
+          detail: `「${pack.name}」与「${other.name}」互斥，不能出现在同一份证明中。`,
+          stepId: owner?.id,
+        });
+      }
+    });
+  });
 
   document.steps.forEach((step, index) => {
     const tokens = stripLatexCommands(step.statement).match(/\b[A-Za-z][A-Za-z0-9']*\b/g) ?? [];
@@ -258,6 +459,47 @@ export function validate(document: ProofDocument): ProofCheck[] {
     step.references.forEach((reference) => {
       if (!ids.has(reference)) {
         checks.push({ id: `missing-${step.id}-${reference}`, severity: 'error', title: '引用步骤不存在', detail: `步骤 ${index + 1} 引用了已删除的步骤 ${reference}`, stepId: step.id });
+      }
+    });
+
+    if (isPremiseAxiom(step)) return;
+
+    // 规则包引用检查：没有绑定、没有来源快照、槽位未绑定或绑定失效都不能通过。
+    const binding = step.binding;
+    if (!binding) {
+      checks.push({ id: `binding-none-${step.id}`, severity: 'error', title: '缺少规则包引用', detail: `步骤 ${index + 1} 只记录了规则名称「${step.rule}」，请在检查器中绑定规则与槽位。`, stepId: step.id });
+      return;
+    }
+    if (!binding.snapshot) {
+      checks.push({ id: `binding-source-${step.id}`, severity: 'error', title: '待确认映射未解析来源', detail: `步骤 ${index + 1} 的规则名称「${binding.legacyRuleName ?? step.rule}」在多个规则包中存在同名规则，请选择来源后再绑定槽位。`, stepId: step.id });
+      return;
+    }
+    const slotIssues = validateBinding(binding, step, document);
+    if (binding.status === 'stale') {
+      checks.push({
+        id: `binding-stale-${step.id}`,
+        severity: 'error',
+        title: '引用依据待复核',
+        detail: `步骤 ${index + 1} 引用的「${binding.snapshot.ruleName}」所在规则包已更新（原 ${binding.snapshot.packVersion}），原绑定已保留，逐条确认后方可导出。`,
+        stepId: step.id,
+      });
+    }
+    slotIssues.forEach((issue) => {
+      checks.push({ id: `slot-${step.id}-${issue.slotId}`, severity: 'error', title: '规则槽位未通过检查', detail: `步骤 ${index + 1}：${issue.message}`, stepId: step.id });
+    });
+    if (binding.status === 'pending' && !slotIssues.length) {
+      checks.push({ id: `binding-pending-${step.id}`, severity: 'warning', title: '规则引用待确认', detail: `步骤 ${index + 1} 的槽位已绑定，确认「${binding.snapshot.ruleName}」依据后即可导出。`, stepId: step.id });
+    }
+
+    // 前提槽绑定的步骤应出现在本步之前。
+    const currentIndex = index;
+    const rule = binding.snapshot.rule;
+    rule.slots.forEach((slot) => {
+      if (slot.kind !== 'premise') return;
+      const boundId = binding.slots[slot.id];
+      const boundIndex = document.steps.findIndex((item) => item.id === boundId);
+      if (boundIndex >= currentIndex) {
+        checks.push({ id: `slot-order-${step.id}-${slot.id}`, severity: 'warning', title: '前提槽引用了后续步骤', detail: `步骤 ${index + 1} 的「${slot.label}」应绑定出现在它之前的步骤。`, stepId: step.id });
       }
     });
   });
@@ -291,7 +533,7 @@ export function validate(document: ProofDocument): ProofCheck[] {
   }
 
   if (!checks.some((check) => check.severity === 'error')) {
-    checks.push({ id: 'proof-ok', severity: 'info', title: '结构检查通过', detail: '未发现缺失引用、循环引用或未证明目标。' });
+    checks.push({ id: 'proof-ok', severity: 'info', title: '结构检查通过', detail: '未发现缺失引用、循环引用、未证明目标或失效的规则引用。' });
   }
   return checks;
 }
